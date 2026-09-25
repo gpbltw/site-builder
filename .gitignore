@@ -1,0 +1,26 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Virtualenv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SQLite
+*.sqlite3
+*.sqlite3-*
+
+# Generated site
+output/
+
+# OS
+.DS_Store
+Thumbs.db
