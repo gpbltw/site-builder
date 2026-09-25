@@ -1,10 +1,10 @@
+import asyncio
 import re
-import time
 from types import SimpleNamespace
 
 
-class RetryingGroq:
-    """Обёртка над Groq-клиентом, повторяющая запросы при 429.
+class AsyncRetryingGroq:
+    """Async-обёртка над Groq, повторяющая запросы при 429.
 
     Задержку берёт из текста ошибки Groq
     ('Please try again in 1.07s'). Экспоненциальный backoff
@@ -33,13 +33,15 @@ class RetryingGroq:
         unit = match.group(2)
         return value / 1000 if unit == "ms" else value
 
-    def _create(self, **kwargs):
+    async def _create(self, **kwargs):
         delay = self.BACKOFF_BASE
         last_error = None
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                return self.inner.chat.completions.create(**kwargs)
+                return await self.inner.chat.completions.create(
+                    **kwargs
+                )
             except Exception as exc:
                 status = getattr(exc, "status_code", None)
                 message = str(exc)
@@ -56,7 +58,7 @@ class RetryingGroq:
                         f"{attempt + 1}/{self.MAX_RETRIES} "
                         f"in {sleep_for:.2f}s"
                     )
-                    time.sleep(sleep_for)
+                    await asyncio.sleep(sleep_for)
                     delay = min(
                         delay * 2, self.BACKOFF_CAP,
                     )
@@ -66,15 +68,16 @@ class RetryingGroq:
 
         raise last_error
 
-    def close(self):
-        """Прокси к inner.close() — нужен для `with`."""
+    async def close(self):
         close = getattr(self.inner, "close", None)
-        if callable(close):
-            close()
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
         return False

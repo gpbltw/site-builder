@@ -148,3 +148,26 @@ def test_rejects_duplicate_selector(tmp_path):
         and "body" in e
         for e in result["errors"]
     )
+
+def test_malformed_opening_tag(tmp_path):
+    """Открывающий тег без '>' должен ловиться."""
+    (tmp_path / "index.html").write_text(
+        '<!DOCTYPE html>\n'
+        '<html><head><title>T</title></head>\n'
+        '<body>\n'
+        '<h1>Hi</h1>\n'
+        '<section class="advantages"\n'
+        '  <h2>Преимущества</h2>\n'
+        '<article><p>Текст.</p></article>\n'
+        '</section>\n'
+        '</body></html>',
+        encoding="utf-8",
+    )
+
+    result = SiteVerifier(tmp_path).verify_html("index.html")
+
+    assert result["status"] == "error"
+    assert any(
+        "malformed" in e and "section" in e
+        for e in result["errors"]
+    )

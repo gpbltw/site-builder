@@ -102,6 +102,20 @@ class SiteVerifier:
         if "</body>" not in lowered:
             errors.append("missing closing </body> tag")
 
+        # Синтаксис открывающих тегов: ищем `<tag attr`
+        # без закрывающего `>` до конца строки.
+        # Модель иногда теряет `>` при генерации.
+        malformed_pattern = re.compile(
+            r"<(section|article|header|main|div|nav|ul|li|p|h[1-6])"
+            r"\s[^>]*$",
+            re.MULTILINE,
+        )
+
+        for tag in malformed_pattern.findall(text):
+            errors.append(
+                f"malformed opening tag: <{tag} без '>'"
+            )
+
         # Проверяем линки. Различаем:
         #  - <a href="..."> — переход на страницу: ошибка,
         #    если файла нет.

@@ -29,11 +29,25 @@ CONTENT_CHECK_SYSTEM_PROMPT = (
     "Не пиши советы и улучшения. Только то, что было "
     "явно запрошено и отсутствует. Если всё на месте — "
     "просто 'STATUS: OK' без MISSING."
+    "Важно про CSS и HTML:\n"
+    "- CSS-правила применяются через селекторы (класс, "
+    "тег), а НЕ через имя HTML-файла. Одно правило "
+    "'nav.site-nav { ... }' действует на всех страницах, "
+    "где есть <nav class=\"site-nav\">.\n"
+    "- Не требуй отдельной правки для about.html, если "
+    "CSS-правило уже покрывает нужный селектор. "
+    "Проверь, что селектор присутствует в CSS — этого "
+    "достаточно для всех страниц.\n"
+    "- Если в payload есть '... [середина файла пропущена]' "
+    "или '[omitted, total limit reached]' — сообщи об "
+    "этом в ответе как о проблеме HARNESS, а не как о "
+    "проблеме задачи. Не делай вывод 'правил нет', "
+    "если ты их просто не видишь.\n"
 )
 
 
-MAX_FILE_CHARS = 3000
-MAX_TOTAL_CHARS = 8000
+MAX_FILE_CHARS = 6000
+MAX_TOTAL_CHARS = 24000
 
 
 def _collect_files(output_dir: Path) -> str:
@@ -60,7 +74,7 @@ def _collect_files(output_dir: Path) -> str:
             # Показываем начало И конец — иначе checker
             # не видит поздние правила и даёт ложные выводы.
             head = MAX_FILE_CHARS // 2
-            tail = MAX_FILE_CHARS - head - 40
+            tail = MAX_FILE_CHARS - head - 60
             text = (
                 text[:head]
                 + "\n\n... [середина файла пропущена] ...\n\n"
@@ -110,7 +124,7 @@ def _parse_issues(text: str) -> list[str]:
     return issues
 
 
-def check_content(
+async def check_content(
     client,
     model: str,
     task: str,
@@ -118,16 +132,7 @@ def check_content(
     budget: TaskBudget,
     max_completion_tokens: int = 600,
 ) -> dict:
-    """Проверяет полноту сгенерированного сайта.
-
-    Возвращает:
-      {
-        "status": "ok" | "incomplete" | "unparsed" | "error",
-        "issues": [...],
-        "raw": str,
-        "error": str | None,
-      }
-    """
+    """Проверяет полноту сгенерированного сайта."""
     output_dir = Path(output_dir).resolve()
 
     if not budget.try_consume_model_call():
@@ -166,7 +171,7 @@ def check_content(
         f"(вызов {budget.used_model_calls}/{budget.max_model_calls})"
     )
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=messages,
         max_completion_tokens=max_completion_tokens,

@@ -1,25 +1,26 @@
 import argparse
+import asyncio
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from groq import APIError, Groq
+from groq import APIError, AsyncGroq
 
 from budget import TaskBudget
 from content_checker import check_content
 from planner import plan_edit
-from retry_client import RetryingGroq
+from retry_client import AsyncRetryingGroq
 from section_writer import generate_section
 from tools import FileTools
 from verifier import SiteVerifier
 
 
-def build_snapshot(
-    tools: FileTools,
-    max_file_chars: int = 1500,
-) -> str:
-    """Собирает текстовое описание проекта для planner'а."""
+MAX_PARALLEL_FILES = 2
+
+
+def build_snapshot(tools, max_file_chars: int = 1500) -> str:
     files = tools.list_files().get("files", [])
     if not files:
         return "(проект пуст)"
@@ -46,32 +47,21 @@ def build_snapshot(
     return "\n\n".join(parts)
 
 
-def execute_insert_section(
-    client,
-    model: str,
-    tools: FileTools,
-    verifier: SiteVerifier,
-    budget: TaskBudget,
-    file_path: str,
-    description: str,
-) -> dict:
-    """Генерирует HTML-фрагмент и вставляет его в конец <main>."""
-
-    # Раннее отклонение, если файл не HTML.
+async def execute_insert_section(
+    client, model, tools, verifier, budget,
+    file_path, description,
+):
     if not file_path.endswith((".html", ".htm")):
         return {
             "status": "failed",
             "error": (
                 f"insert_section работает только с HTML. "
-                f"{file_path} — не HTML. Для CSS используй "
-                f"edit_file или append_file."
+                f"{file_path} — не HTML."
             ),
         }
 
-    # 1. Генерируем секцию.
-    gen = generate_section(
-        client=client,
-        model=model,
+    gen = await generate_section(
+        client=client, model=model,
         section_name=description[:60],
         description=description,
         budget=budget,
@@ -79,13 +69,9 @@ def execute_insert_section(
     if gen["status"] != "ok" or len(gen["html"]) < 30:
         return {
             "status": "failed",
-            "error": (
-                f"секция не сгенерирована: "
-                f"{gen.get('error', 'too short')}"
-            ),
+            "error": f"секция: {gen.get('error', 'too short')}",
         }
 
-    # 2. Определяем точку вставки.
     read = tools.read_file(file_path)
     if "error" in read:
         return {"status": "failed", "error": read["error"]}
@@ -101,7 +87,6 @@ def execute_insert_section(
             "error": f"нет </main> или </body> в {file_path}",
         }
 
-    # 3. Списываем tool call и вставляем.
     if not budget.try_consume_tool_calls(1):
         return {
             "status": "limit_reached",
@@ -121,17 +106,10 @@ def execute_insert_section(
     }
 
 
-def execute_append_file(
-    client,
-    model: str,
-    tools: FileTools,
-    verifier: SiteVerifier,
-    budget: TaskBudget,
-    file_path: str,
-    description: str,
-) -> dict:
-    """Генерирует содержимое и добавляет в конец файла."""
-
+async def execute_append_file(
+    client, model, tools, verifier, budget,
+    file_path, description,
+):
     if not budget.try_consume_model_call():
         return {
             "status": "limit_reached",
@@ -139,23 +117,19 @@ def execute_append_file(
         }
 
     is_css = file_path.endswith(".css")
-
     system = (
         "Ты генерируешь фрагмент для добавления в конец файла. "
         "Верни ТОЛЬКО содержимое, без ```, без пояснений.\n"
     )
     if is_css:
         system += (
-            "\nПравила для CSS:\n"
-            "- только ЧИСТЫЙ CSS, без SCSS-функций "
-            "(lighten, darken, mix — запрещены);\n"
-            "- компактная запись;\n"
-            "- все скобки закрыты."
+            "\nТолько ЧИСТЫЙ CSS. Без SCSS-функций "
+            "(lighten, darken, mix). Все скобки закрыты."
         )
 
     print(f"\n[Editor] append_file: {file_path}")
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -175,8 +149,6 @@ def execute_append_file(
         )
 
     text = (response.choices[0].message.content or "").strip()
-
-    # Снимаем markdown-обёртку.
     if text.startswith("```"):
         first_nl = text.find("\n")
         if first_nl != -1:
@@ -205,23 +177,13 @@ def execute_append_file(
     else:
         verify = {"status": "skipped"}
 
-    return {
-        "status": "ok",
-        "verification": verify,
-    }
+    return {"status": "ok", "verification": verify}
 
 
-def execute_write_file(
-    client,
-    model: str,
-    tools: FileTools,
-    verifier: SiteVerifier,
-    budget: TaskBudget,
-    file_path: str,
-    description: str,
-) -> dict:
-    """Генерирует файл целиком и записывает."""
-
+async def execute_write_file(
+    client, model, tools, verifier, budget,
+    file_path, description,
+):
     if not budget.try_consume_model_call():
         return {
             "status": "limit_reached",
@@ -229,43 +191,28 @@ def execute_write_file(
         }
 
     is_css = file_path.endswith(".css")
-
     system = (
         "Ты генерируешь файл для сайта. "
-        "Верни ТОЛЬКО содержимое файла, без ```, без "
-        "пояснений, без markdown.\n"
+        "Верни ТОЛЬКО содержимое, без ```, без пояснений.\n"
     )
     if is_css:
         system += (
             "\nПравила для CSS:\n"
-            "- компактная запись: правило в одну строку, "
-            "если оно короткое;\n"
-            "- используй CSS-переменные через :root;\n"
-            "- современные практики: flexbox, grid, "
-            "clamp() для размеров, transition;\n"
-            "- не больше 50 строк.\n"
-            "\n"
-            "КРИТИЧНО — только ЧИСТЫЙ CSS:\n"
-            "- НЕ используй SCSS-функции: lighten(), "
-            "darken(), saturate(), fade(), mix(), tint(), "
-            "shade(). Их нет в CSS.\n"
-            "- Для прозрачности: rgba(255,255,255,0.1) "
-            "или отдельная переменная --accent-hover.\n"
-            "- Для hover-цвета просто впиши hex или "
-            "переменную напрямую."
+            "- компактная запись;\n"
+            "- CSS-переменные через :root;\n"
+            "- только ЧИСТЫЙ CSS, без SCSS-функций;\n"
+            "- не больше 50 строк."
         )
     else:
         system += (
             "\nПравила для HTML:\n"
             "- начинай с <!DOCTYPE html>;\n"
-            "- заканчивай </body></html>;\n"
-            "- в <head>: <meta charset=\"UTF-8\">, <title>, "
-            "<link rel=\"stylesheet\" href=\"css/style.css\">."
+            "- заканчивай </body></html>."
         )
 
     print(f"\n[Editor] write_file: {file_path}")
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -291,12 +238,10 @@ def execute_write_file(
         return {
             "status": "failed",
             "error": (
-                f"файл обрезан лимитом ({len(text)} символов). "
-                f"Задача слишком большая для одного write_file."
+                f"файл обрезан лимитом ({len(text)} символов)."
             ),
         }
 
-    # Снимаем markdown-обёртку.
     if text.startswith("```"):
         first_nl = text.find("\n")
         if first_nl != -1:
@@ -332,20 +277,10 @@ def execute_write_file(
     }
 
 
-def execute_edit_file(
-    client,
-    model: str,
-    tools: FileTools,
-    verifier: SiteVerifier,
-    budget: TaskBudget,
-    file_path: str,
-    instruction: str,
-) -> dict:
-    """Точечные правки через модель + edit_file_many.
-
-    При ошибке применяет retry с обратной связью: модель
-    видит конкретную ошибку и актуальное содержимое файла.
-    """
+async def execute_edit_file(
+    client, model, tools, verifier, budget,
+    file_path, instruction,
+):
     read = tools.read_file(file_path)
     if "error" in read:
         return {"status": "failed", "error": read["error"]}
@@ -361,17 +296,10 @@ def execute_edit_file(
         '{"edits": [{"old": "...", "new": "..."}, ...]}\n'
         "\n"
         "Правила:\n"
-        "1. Один edit — одна замена. Если нужно заменить "
-        "несколько мест — верни несколько edits.\n"
-        "2. old должен ТОЧНО совпадать с фрагментом в файле "
-        "(включая пробелы и переносы строк).\n"
-        "3. old должен быть уникальным — встречаться в файле "
-        "ровно один раз.\n"
-        "4. new — текст для замены.\n"
-        "5. Если instruction говорит 'перевести текст' — "
-        "включай в edits ВСЕ фрагменты, которые надо "
-        "перевести, а не только первый.\n"
-        "6. Без markdown, без ```, только JSON.\n"
+        "1. Один edit — одна замена.\n"
+        "2. old должен ТОЧНО совпадать с фрагментом.\n"
+        "3. old должен встречаться ровно один раз.\n"
+        "4. Без markdown, только JSON.\n"
     )
     user = (
         f"Файл: {file_path}\n"
@@ -381,7 +309,7 @@ def execute_edit_file(
 
     print(f"\n[Editor] {file_path}: {instruction[:80]}")
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -415,10 +343,7 @@ def execute_edit_file(
 
     edits = data.get("edits", [])
     if not isinstance(edits, list) or not edits:
-        return {
-            "status": "failed",
-            "error": "нет edits в ответе",
-        }
+        return {"status": "failed", "error": "нет edits"}
 
     print(f"[Editor] правок в ответе: {len(edits)}")
 
@@ -433,13 +358,11 @@ def execute_edit_file(
     if "error" in result:
         print(f"[Editor] edit_file_many error: {result['error']}")
 
-        # Retry с обратной связью.
         if not budget.try_consume_model_call():
             return {
                 "status": "failed",
                 "error": (
-                    f"first attempt failed: {result['error']}; "
-                    f"нет бюджета на retry"
+                    f"first attempt failed: {result['error']}"
                 ),
             }
 
@@ -453,11 +376,10 @@ def execute_edit_file(
             f"Содержимое файла (актуальное):\n"
             f"{tools.read_file(file_path)['content']}\n\n"
             f"Верни новые edits. Копируй old ТОЧНО "
-            f"из файла выше, включая все пробелы. "
-            f"Каждый old должен встречаться ровно один раз."
+            f"из файла выше."
         )
 
-        retry_response = client.chat.completions.create(
+        retry_response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system},
@@ -465,13 +387,6 @@ def execute_edit_file(
             ],
             max_completion_tokens=800,
         )
-
-        if retry_response.usage:
-            u = retry_response.usage
-            print(
-                f"[Editor] retry токены: вход={u.prompt_tokens}, "
-                f"генерация={u.completion_tokens}"
-            )
 
         retry_text = (
             retry_response.choices[0].message.content or ""
@@ -488,10 +403,7 @@ def execute_edit_file(
         except json.JSONDecodeError:
             return {
                 "status": "failed",
-                "error": (
-                    f"retry: не JSON. "
-                    f"Первая ошибка: {result['error']}"
-                ),
+                "error": f"retry: не JSON",
             }
 
         retry_edits = retry_data.get("edits", [])
@@ -507,21 +419,15 @@ def execute_edit_file(
                 "error": f"tool budget: {budget.snapshot()}",
             }
 
-        print(
-            f"[Editor] retry правок: {len(retry_edits)}"
-        )
+        print(f"[Editor] retry правок: {len(retry_edits)}")
         result = tools.edit_file_many(file_path, retry_edits)
 
         if "error" in result:
             return {
                 "status": "failed",
-                "error": (
-                    f"retry тоже провалился: "
-                    f"{result['error']}"
-                ),
+                "error": f"retry тоже провалился: {result['error']}",
             }
 
-    # Верификация.
     if file_path.endswith((".html", ".htm")):
         verify = verifier.verify_html(file_path)
     elif file_path.endswith(".css"):
@@ -536,45 +442,88 @@ def execute_edit_file(
     }
 
 
-def execute_operation(
-    client,
-    model: str,
-    tools: FileTools,
-    verifier: SiteVerifier,
-    budget: TaskBudget,
-    op: dict,
-) -> dict:
+async def execute_operation(
+    client, model, tools, verifier, budget, op,
+):
     op_type = op["op"]
     file_path = op["file"]
 
     if op_type == "insert_section":
-        return execute_insert_section(
+        return await execute_insert_section(
             client, model, tools, verifier, budget,
             file_path, op["description"],
         )
-
     if op_type == "append_file":
-        return execute_append_file(
+        return await execute_append_file(
             client, model, tools, verifier, budget,
             file_path, op["description"],
         )
-
     if op_type == "edit_file":
-        return execute_edit_file(
+        return await execute_edit_file(
             client, model, tools, verifier, budget,
             file_path, op["instruction"],
         )
-
     if op_type == "write_file":
-        return execute_write_file(
+        return await execute_write_file(
             client, model, tools, verifier, budget,
             file_path, op["description"],
         )
-
     return {"status": "failed", "error": f"unknown op {op_type}"}
 
 
-def edit_site(
+async def execute_operations_grouped(
+    client, model, tools, verifier, budget, operations,
+):
+    """Группирует операции по файлам.
+
+    Внутри одного файла — строго последовательно.
+    Разные файлы — параллельно, но не более
+    MAX_PARALLEL_FILES одновременно.
+    """
+    by_file: dict[str, list[dict]] = defaultdict(list)
+    for op in operations:
+        by_file[op["file"]].append(op)
+
+    print(
+        f"\n[Editor] групп по файлам: {len(by_file)} "
+        f"(max параллельно: {MAX_PARALLEL_FILES})"
+    )
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_FILES)
+
+    async def run_file_group(file_path, ops):
+        results = []
+        async with semaphore:
+            for i, op in enumerate(ops, 1):
+                print(
+                    f"[Editor] {file_path} "
+                    f"({i}/{len(ops)}): {op['op']}"
+                )
+                r = await execute_operation(
+                    client, model, tools, verifier, budget, op,
+                )
+                results.append({"op": op, "result": r})
+                if r["status"] != "ok":
+                    print(
+                        f"[Editor] ошибка в {file_path}: "
+                        f"{r.get('error')}"
+                    )
+        return file_path, results
+
+    tasks = [
+        run_file_group(path, ops)
+        for path, ops in by_file.items()
+    ]
+    grouped_results = await asyncio.gather(*tasks)
+
+    # Разворачиваем обратно в исходный порядок.
+    flat: list[dict] = []
+    for _, results in grouped_results:
+        flat.extend(results)
+    return flat
+
+
+async def edit_site(
     client,
     model: str,
     task: str,
@@ -599,12 +548,10 @@ def edit_site(
     print(f"[Editor] output={output_dir}")
     print(f"[Editor] budget start: {budget.snapshot()}")
 
-    # 1. Снимок проекта.
     snapshot = build_snapshot(tools)
     print(f"[Editor] snapshot: {len(snapshot)} символов")
 
-    # 2. План.
-    plan = plan_edit(
+    plan = await plan_edit(
         client=client,
         model=model,
         task=task,
@@ -618,22 +565,19 @@ def edit_site(
             "plan": plan,
         }
 
-    # 3. Выполнение операций.
-    results = []
-    for i, op in enumerate(plan["operations"], 1):
+    if not plan["operations"]:
         print(
-            f"\n[Editor] Операция {i}/{len(plan['operations'])}: "
-            f"{op['op']} → {op['file']}"
+            "\n[Editor] план пустой — менять нечего, "
+            "перехожу к финальной проверке"
         )
-        r = execute_operation(
-            client, model, tools, verifier, budget, op,
+        operations_results = []
+    else:
+        operations_results = await execute_operations_grouped(
+            client, model, tools, verifier, budget,
+            plan["operations"],
         )
-        results.append({"op": op, "result": r})
-        if r["status"] != "ok":
-            print(f"[Editor] ошибка: {r.get('error')}")
 
-    # 4. Финальная проверка полноты.
-    check = check_content(
+    check = await check_content(
         client=client,
         model=model,
         task=task,
@@ -641,7 +585,6 @@ def edit_site(
         budget=budget,
     )
 
-    # 5. Проверка структуры.
     verify = verifier.verify_site()
 
     print(f"\n[Editor] budget end: {budget.snapshot()}")
@@ -651,19 +594,15 @@ def edit_site(
     return {
         "status": verify["status"],
         "plan": plan,
-        "operations": results,
+        "operations": operations_results,
         "check": check,
         "verification": verify,
     }
 
 
-def main() -> None:
+async def async_main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--task",
-        required=True,
-        help="Что нужно изменить на сайте.",
-    )
+    parser.add_argument("--task", required=True)
     parser.add_argument("--output", default="output")
     parser.add_argument("--max-model-calls", type=int, default=20)
     parser.add_argument("--max-tool-calls", type=int, default=20)
@@ -674,21 +613,22 @@ def main() -> None:
     model = os.getenv("GROQ_MODEL")
     if not api_key or not model:
         print("Укажи GROQ_API_KEY и GROQ_MODEL в .env.")
-        return
+        return 1
 
-    with Groq(
+    async with AsyncGroq(
         api_key=api_key, timeout=60.0, max_retries=0,
-    ) as raw:
-        client = RetryingGroq(raw)
+    ) as raw_client:
+        client = AsyncRetryingGroq(raw_client)
+
         try:
-            result = edit_site(
+            result = await edit_site(
                 client, model, args.task, args.output,
                 max_model_calls=args.max_model_calls,
                 max_tool_calls=args.max_tool_calls,
             )
         except (APIError, RuntimeError) as e:
             print(f"\nОстановлено: {e}")
-            return
+            return 1
 
         print(f"\n=== Итог ===")
         print(f"статус: {result['status']}")
@@ -698,6 +638,13 @@ def main() -> None:
             print(
                 f"rate-limit waits: {client.rate_limit_waits}"
             )
+
+    return 0
+
+
+def main() -> None:
+    exit_code = asyncio.run(async_main())
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

@@ -23,40 +23,67 @@ PLANNER_SYSTEM_PROMPT = (
     "Правила:\n"
     "1. Разбивай задачу на 1-4 операции. Каждая операция — "
     "одна логическая правка.\n"
-    "2. insert_section работает ТОЛЬКО с HTML-файлами "
-    "(.html, .htm). Он вставляет фрагмент перед </main> "
-    "или </body>.\n"
-    "2a. Для CSS-файлов (.css) НИКОГДА не используй "
+    "2. insert_section работает ТОЛЬКО с HTML-файлами. "
+    "Он вставляет фрагмент перед </main> или </body>.\n"
+    "2a. Для CSS-файлов НИКОГДА не используй "
     "insert_section. Чтобы добавить правило в конец "
-    "CSS-файла — используй edit_file с instruction "
-    "'добавить в конец файла правило ...'.\n"
+    "CSS — используй append_file. Чтобы добавить правило "
+    "в середину CSS — edit_file.\n"
     "2b. Если задача — 'добавить в конец файла', "
     "используй append_file, а не edit_file. "
-    "edit_file для этого ненадёжен — он требует "
-    "точного old-фрагмента, который модель может "
-    "указать неточно.\n"
+    "append_file не требует old и не может промахнуться.\n"
+    "2c. КРИТИЧНО: если задача про ОБЩИЙ UI-элемент "
+    "(кнопка переключения темы, навигация, footer, общий "
+    "скрипт, header) — применяй его ко ВСЕМ HTML-страницам "
+    "проекта. Посмотри snapshot: если в проекте больше "
+    "одного .html — добавь операцию для каждой страницы.\n"
     "3. instruction для edit_file должна быть ЯВНОЙ и "
     "ПОЛНОЙ. Не сужай задачу: если пользователь сказал "
     "'переведи блок' — инструкция должна быть 'перевести "
     "ВЕСЬ текст в секции X на русский', а не 'перевести "
     "заголовок'. Указывай: что найти, где именно, что "
     "сделать.\n"
-    "4. description для insert_section — ОПИСАНИЕ "
-    "содержимого на русском, не HTML. Например: 'три "
-    "карточки преимуществ: h2 + 3 article с h3 и p'.\n"
-    "5. Не смешивай файлы в одной операции.\n"
+    "4. description для insert_section и append_file — "
+    "ОПИСАНИЕ содержимого на русском, не HTML. Например: "
+    "'три карточки преимуществ: h2 + 3 article с h3 и p'.\n"
+    "5. Не смешивай файлы в одной операции. Одна "
+    "операция — один файл.\n"
     "6. Возвращай ТОЛЬКО JSON без markdown.\n"
     "\n"
-    "Формат:\n"
+    "Примеры:\n"
+    "\n"
+    "Задача: 'Добавь переключение темы на сайте'\n"
+    "План (для сайта из index.html и about.html):\n"
+    "{\n"
+    '  "operations": [\n'
+    '    {"op": "append_file", "file": "css/style.css", '
+    '"description": "блок :root.light с переменными '
+    'светлой темы, стили .theme-toggle"},\n'
+    '    {"op": "edit_file", "file": "index.html", '
+    '"instruction": "Добавить кнопку темы и скрипт '
+    'переключения перед </body>"},\n'
+    '    {"op": "edit_file", "file": "about.html", '
+    '"instruction": "Добавить кнопку темы и скрипт '
+    'переключения перед </body>"}\n'
+    "  ]\n"
+    "}\n"
+    "\n"
+    "Задача: 'Переведи блок how-it-works на русский'\n"
     "{\n"
     '  "operations": [\n'
     '    {"op": "edit_file", "file": "index.html", '
     '"instruction": "Перевести на русский ВЕСЬ текст '
     'внутри <section class=\\"how-it-works\\">: заголовок '
-    'h2 и оба параграфа p. Сохранить структуру тегов."}\n'
+    'h2 и оба параграфа p."}\n'
     "  ]\n"
-    "}"
+    "}\n"
 )
+
+
+VALID_OPS = {
+    "insert_section", "append_file", "edit_file", "write_file",
+}
+MAX_OPERATIONS = 4
 
 
 def _strip_fence(text: str) -> str:
@@ -77,7 +104,6 @@ def _extract_json(text: str) -> dict | None:
     except json.JSONDecodeError:
         pass
 
-    # Ищем первую { ... последнюю }
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -89,10 +115,8 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-VALID_OPS = {"insert_section", "append_file", "edit_file", "write_file"}
-
-
 def _validate_plan(data: dict) -> list[dict]:
+    """Проверяет план и возвращает список валидных операций."""
     ops = data.get("operations", [])
     if not isinstance(ops, list):
         return []
@@ -101,28 +125,40 @@ def _validate_plan(data: dict) -> list[dict]:
     for item in ops:
         if not isinstance(item, dict):
             continue
+
         op = item.get("op")
         f = item.get("file")
-        if op not in VALID_OPS or not isinstance(f, str):
+
+        if op not in VALID_OPS:
             continue
+        if not isinstance(f, str) or not f.strip():
+            continue
+
         if op == "insert_section":
             if not item.get("description"):
                 continue
+            if not f.endswith((".html", ".htm")):
+                # Ранняя отбраковка: insert_section только для HTML.
+                continue
+
         if op == "append_file":
             if not item.get("description"):
                 continue
+
         if op == "edit_file":
             if not item.get("instruction"):
                 continue
+
         if op == "write_file":
             if not item.get("description"):
                 continue
+
         valid.append(item)
 
-    return valid[:4]  # жёсткий лимит
+    return valid[:MAX_OPERATIONS]
 
 
-def plan_edit(
+async def plan_edit(
     client,
     model: str,
     task: str,
@@ -151,12 +187,14 @@ def plan_edit(
     user_prompt = (
         f"ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n{task}\n\n"
         f"СТРУКТУРА ПРОЕКТА:\n{project_snapshot}\n\n"
-        f"Составь JSON-план операций."
+        f"Составь JSON-план операций. Помни: если задача "
+        f"про ОБЩИЙ UI — примени его ко ВСЕМ HTML-страницам "
+        f"проекта. Не больше {MAX_OPERATIONS} операций."
     )
 
     print(f"\n[Planner] Составляю план")
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
@@ -193,20 +231,36 @@ def plan_edit(
             "error": "could not parse JSON plan",
         }
 
-    ops = _validate_plan(data)
-    if not ops:
-        print(f"[Planner] план пустой или невалидный")
+    # Отличаем "нечего делать" от "не смог распарсить".
+    raw_ops = data.get("operations", [])
+    if isinstance(raw_ops, list) and len(raw_ops) == 0:
+        print(
+            "[Planner] план: 0 операций "
+            "(модель решила, что менять нечего)"
+        )
         return {
-            "status": "empty",
+            "status": "ok",
             "operations": [],
             "raw": text,
-            "error": "no valid operations in plan",
+            "error": None,
+        }
+
+    ops = _validate_plan(data)
+    if not ops:
+        print("[Planner] невалидные операции в плане")
+        return {
+            "status": "failed",
+            "operations": [],
+            "raw": text,
+            "error": "no valid operations after validation",
         }
 
     print(f"[Planner] план: {len(ops)} операций")
     for op in ops:
+        preview = op.get("instruction") or op.get("description", "")
+        preview = preview[:70]
         print(
-            f"[Planner]   {op['op']} → {op['file']}"
+            f"[Planner]   {op['op']} → {op['file']} — {preview}"
         )
 
     return {
